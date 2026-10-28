@@ -632,6 +632,7 @@ def build_harbor_command(
         harbor_agent = OPENCODE_IMPORT_PATH
         agent_kwargs.append(f"version={OPENCODE_VERSION}")
         agent_kwargs.append("collect_session_usage=true")
+        agent_kwargs.append("collect_session_trace=true")
         if support.opencode is not None:
             provider = resolve_opencode_model(model).configuration
             harbor_model = provider.harbor_model

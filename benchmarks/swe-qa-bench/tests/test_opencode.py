@@ -27,6 +27,7 @@ from zg_bench.agents.opencode import (
 )
 from zg_bench.agents.zvec_opencode import ZvecOpenCode
 from zg_bench.agents.opencode_usage import USAGE_SQL
+from zg_bench.agents.opencode_trace import trace_capture_script
 
 
 class _InstallHarness(ResilientOpenCode):
@@ -70,7 +71,9 @@ class ResilientOpenCodeTests(unittest.IsolatedAsyncioTestCase):
         ) as sleep:
             await agent.install(object())
 
-        self.assertEqual(len(agent.root_commands), 1)
+        self.assertEqual(len(agent.root_commands), 2)
+        self.assertEqual(agent.root_commands[0], "apt-get update && apt-get install -y curl")
+        self.assertIn("/usr/local/bin/rg", agent.root_commands[1])
         self.assertEqual(len(agent.agent_commands), 3)
         self.assertEqual(sleep.await_count, 2)
         command = agent.agent_commands[0]
@@ -97,6 +100,7 @@ class ResilientOpenCodeTests(unittest.IsolatedAsyncioTestCase):
                 agent = ResilientOpenCode(logs_dir=Path(temp), collect_session_usage=True)
                 context = AgentContext()
                 with (
+                    patch.object(agent, "_verify_ripgrep", new=AsyncMock()),
                     patch.object(OpenCode, "run", new=AsyncMock(side_effect=error)),
                     patch.object(agent, "exec_as_agent", new=AsyncMock()) as export,
                 ):
@@ -116,6 +120,7 @@ class ResilientOpenCodeTests(unittest.IsolatedAsyncioTestCase):
             agent = ResilientOpenCode(logs_dir=Path(temp), collect_session_usage=True)
             context = AgentContext()
             with (
+                patch.object(agent, "_verify_ripgrep", new=AsyncMock()),
                 patch.object(OpenCode, "run", new=AsyncMock(side_effect=ValueError("original"))),
                 patch.object(agent, "exec_as_agent", new=AsyncMock(side_effect=TimeoutError())),
                 self.assertRaisesRegex(ValueError, "original"),
@@ -129,6 +134,49 @@ class ResilientOpenCodeTests(unittest.IsolatedAsyncioTestCase):
     def test_usage_capture_flag_requires_actual_boolean(self) -> None:
         with self.assertRaisesRegex(ValueError, "boolean"):
             ResilientOpenCode(logs_dir=Path("unused"), collect_session_usage="false")
+
+    def test_trace_capture_flag_requires_actual_boolean(self) -> None:
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            ResilientOpenCode(logs_dir=Path("unused"), collect_session_trace="false")
+
+    async def test_trace_captures_failed_runs_and_keeps_original_instruction(self) -> None:
+        for error in (None, RuntimeError("model failed"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp) / "session-trace"
+                agent = ResilientOpenCode(logs_dir=Path(temp), collect_session_trace=True)
+                context = AgentContext()
+                with (
+                    patch.object(agent, "_verify_ripgrep", new=AsyncMock()),
+                    patch.object(OpenCode, "run", new=AsyncMock(side_effect=error)),
+                    patch.object(agent, "exec_as_agent", new=AsyncMock()) as export,
+                ):
+                    if error is None:
+                        await agent.run("The original question\nwith two lines", object(), context)
+                    else:
+                        with self.assertRaises(type(error)):
+                            await agent.run("The original question\nwith two lines", object(), context)
+                export.assert_awaited_once()
+                self.assertIn("selected(id)", export.call_args.kwargs["command"])
+                self.assertEqual((directory / "instruction.txt").read_text(), "The original question\nwith two lines")
+                manifest = json.loads((directory / "manifest.json").read_text())
+                self.assertEqual(manifest["execution_complete"], error is None)
+                self.assertFalse(manifest["complete"], "a missing export must not pass")
+                self.assertTrue(context.is_empty())
+
+    async def test_failed_trace_export_does_not_mask_model_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            agent = ResilientOpenCode(logs_dir=Path(temp), collect_session_trace=True)
+            with (
+                patch.object(agent, "_verify_ripgrep", new=AsyncMock()),
+                patch.object(OpenCode, "run", new=AsyncMock(side_effect=ValueError("model"))),
+                patch.object(agent, "exec_as_agent", new=AsyncMock(side_effect=TimeoutError())),
+                self.assertRaisesRegex(ValueError, "model"),
+            ):
+                await agent.run("question", object(), AgentContext())
+            agent.populate_context_post_run(AgentContext())
+            manifest = json.loads((Path(temp) / "session-trace/manifest.json").read_text())
+            self.assertIn("trace_capture_failed:TimeoutError", manifest["errors"])
+            self.assertFalse(manifest["complete"])
 
 
 @unittest.skipUnless(
@@ -399,9 +447,28 @@ class OpenCodeSamplingContractTests(unittest.TestCase):
                     )
                     (logs_dir / "opencode.txt").write_text(result.stdout)
                     (logs_dir / "opencode-session-snapshot.json").write_text(snapshot)
+                    self.assertIn("collect_session_trace=true", command)
+                    subprocess.run(
+                        ["node", "-e", trace_capture_script(str(logs_dir), opencode=binary)],
+                        env=env, cwd=corpus, text=True, capture_output=True,
+                        check=True, timeout=90,
+                    )
                     agent._usage_capture_complete = True
+                    agent._trace_execution_complete = True
+                    agent._trace_instruction = "Read README.md and report its fixture value."
                     context = AgentContext()
                     agent.populate_context_post_run(context)
+                    trace_dir = logs_dir / "session-trace"
+                    manifest = json.loads((trace_dir / "manifest.json").read_text())
+                    self.assertTrue(manifest["complete"], manifest["errors"])
+                    self.assertEqual(manifest["counts"]["sessions"], 3)
+                    self.assertEqual(manifest["counts"]["tool_calls"], 4)
+                    trace = json.loads((trace_dir / "trace.json").read_text())
+                    reads = [p for p in trace["parts"] if p["data"].get("tool") == "read"]
+                    self.assertEqual(len(reads), 2)
+                    self.assertTrue(all(p["session_id"] != trace["root_session_id"] for p in reads))
+                    self.assertTrue(all("README.md" in json.dumps(p["data"]["state"]["input"]) for p in reads))
+                    self.assertTrue(all(p["data"]["state"]["output"] for p in reads))
                     usage = json.loads((logs_dir / "session-usage.json").read_text())
                     self.assertTrue(usage["complete"], usage["errors"])
                     self.assertEqual(len(usage["sessions"]), 3)

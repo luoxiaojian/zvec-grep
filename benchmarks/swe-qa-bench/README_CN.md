@@ -50,6 +50,8 @@ Job Summary 单元格使用 `baseline / zvec-grep / change`。每个任务的 ba
 
 新 OpenCode trial 开启 `collect_session_usage=true`。适配器在环境停止前导出主会话及递归关联的全部子代理会话，保存为 `agent/session-usage.json`。采集要求导出完整；会话缺失、导出失败或总数不一致时 trial/报告失败，不能静默回退到主轨迹。报告标记 `opencode-session-tree-v1` 统计口径。JSON 报告和会话产物保留主会话、子代理的用量拆分；Markdown 报告移除 descendants 表格，但总量仍完整计入子代理用量。
 
+本分支同时开启 `collect_session_trace=true`，将提交给 Agent 的问题、主会话和递归子会话的消息、工具参数与返回保存在 `agent/session-trace/`，并记录完整度与文件 SHA256。它独立于用量统计，不把 `session-usage.json` 当作完整操作轨迹。成功 trial 必须通过完整 trace 校验；失败尝试保留可获得的部分证据。每题 artifact 内的 `search-traces/` 提供按 profile、trial 和会话整理的阅读索引，区分 shell `rg`、内置 `grep` 和 zg MCP 调用。两组均安装固定版本 ripgrep，zg 组仍可使用标准工具，因而应比较同一道题的完整搜索路径。候选包、报告和原始证据均保留 90 天；下载方式见 [fork 运行指南](docs/run-in-fork.md)。
+
 - 输入 token 包含非缓存输入、缓存读取和缓存写入；输出 token 包含文本输出及 reasoning，并分别保留组成字段。
 - 工具数包含主会话的委派调用和子代理内部调用，递归覆盖更深层子代理；使用会话、消息和工具标识去重。
 - Agent 墙钟时间已经包含等待子代理的执行时间，不能再累加子代理耗时；采集导出的实测耗时会扣除。

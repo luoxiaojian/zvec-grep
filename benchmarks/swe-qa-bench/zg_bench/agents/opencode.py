@@ -13,10 +13,19 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from zg_bench.agents.opencode_usage import USAGE_SQL, summarize_session_usage
+from zg_bench.agents.opencode_trace import (
+    TRACE_DIRECTORY, trace_capture_command, validate_trace_directory,
+)
+from zg_bench.agents.ripgrep import (
+    RIPGREP_ARCHIVE_SHA256, RIPGREP_ARCHIVE_URL, RIPGREP_PREFLIGHT_FILENAME,
+    parse_ripgrep_preflight, ripgrep_install_command, ripgrep_preflight_command,
+    validate_ripgrep_preflight,
+)
 
 _INSTALL_ATTEMPTS = 3
 _USAGE_CAPTURE_TIMEOUT_SECONDS = 30
 _USAGE_SNAPSHOT_FILENAME = "opencode-session-snapshot.json"
+_TRACE_CAPTURE_TIMEOUT_SECONDS = 90
 
 
 def resilient_nvm_node_install_snippet(
@@ -52,20 +61,65 @@ def resilient_nvm_node_install_snippet(
 class ResilientOpenCode(OpenCode):
     """OpenCode with bounded installation retries and recursive usage capture."""
 
-    def __init__(self, *args, collect_session_usage: bool = False, **kwargs):
+    def __init__(
+        self, *args, collect_session_usage: bool = False,
+        collect_session_trace: bool = False, **kwargs,
+    ):
         if not isinstance(collect_session_usage, bool):
             raise ValueError("collect_session_usage must be a boolean")
+        if not isinstance(collect_session_trace, bool):
+            raise ValueError("collect_session_trace must be a boolean")
         super().__init__(*args, **kwargs)
         self._collect_session_usage = collect_session_usage
         self._usage_capture_complete = False
         self._usage_capture_error: str | None = None
         self._usage_collection_wall_seconds = 0.0
+        self._collect_session_trace = collect_session_trace
+        self._trace_execution_complete = False
+        self._trace_capture_error: str | None = None
+        self._trace_instruction = ""
+        self._trace_collection_wall_seconds = 0.0
+        self._ripgrep_install_wall_seconds = 0.0
+
+    async def _verify_ripgrep(self, environment: BaseEnvironment) -> None:
+        started = time.monotonic()
+        evidence = {"schema_version": 1, "status": "failed"}
+        try:
+            result = await self.exec_as_agent(
+                environment, command=ripgrep_preflight_command(), timeout_sec=30,
+            )
+            evidence = parse_ripgrep_preflight(result.stdout)
+            validate_ripgrep_preflight(evidence)
+        except BaseException as exc:
+            evidence["status"] = "failed"
+            evidence["validation_error"] = type(exc).__name__
+            raise
+        finally:
+            evidence.update(
+                archive_url=RIPGREP_ARCHIVE_URL,
+                archive_sha256=RIPGREP_ARCHIVE_SHA256,
+                install_wall_seconds=self._ripgrep_install_wall_seconds,
+                preflight_wall_seconds=time.monotonic() - started,
+            )
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            (self.logs_dir / RIPGREP_PREFLIGHT_FILENAME).write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+            )
 
     @override
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
-        if not self._collect_session_usage:
+        if self._collect_session_trace:
+            self._trace_instruction = instruction
+            self._trace_execution_complete = False
+            self._trace_capture_error = None
+            self._trace_collection_wall_seconds = 0.0
+            self._write_trace_manifest()
+        # Before creating any model session; descendants inherit this unchanged
+        # container filesystem and OpenCode's original environment.
+        await self._verify_ripgrep(environment)
+        if not self._collect_session_usage and not self._collect_session_trace:
             await super().run(instruction, environment, context)
             return
         execution_complete = False
@@ -75,39 +129,60 @@ class ResilientOpenCode(OpenCode):
             await super().run(instruction, environment, context)
             execution_complete = True
         finally:
-            # Harbor downloads /logs/agent after run() but before stopping the
-            # container. Export here: root stdout/export alone omits children.
-            # Never fill context here; Harbor skips post-run parsing otherwise.
-            started = time.monotonic()
-            destination = f"/logs/agent/{_USAGE_SNAPSHOT_FILENAME}"
-            command = (
-                "set -e; . ~/.nvm/nvm.sh; "
-                f"opencode db {shlex.quote(USAGE_SQL)} --format json "
-                f"> {shlex.quote(destination + '.tmp')}; "
-                f"mv {shlex.quote(destination + '.tmp')} {shlex.quote(destination)}"
+            # Harbor downloads /logs/agent before stopping the container.
+            # Never populate context here: Harbor would skip post-run parsing.
+            self._trace_execution_complete = execution_complete
+            if self._collect_session_trace:
+                started = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self.exec_as_agent(
+                            environment, command=trace_capture_command(),
+                            timeout_sec=_TRACE_CAPTURE_TIMEOUT_SECONDS,
+                        ),
+                        timeout=_TRACE_CAPTURE_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    self._trace_capture_error = type(exc).__name__
+                finally:
+                    # Retain a host-side manifest if log download fails too.
+                    self._write_trace_manifest()
+                    self._trace_collection_wall_seconds = time.monotonic() - started
+            if self._collect_session_usage:
+                await self._capture_usage(environment, execution_complete)
+
+    async def _capture_usage(
+        self, environment: BaseEnvironment, execution_complete: bool,
+    ) -> None:
+        started = time.monotonic()
+        destination = f"/logs/agent/{_USAGE_SNAPSHOT_FILENAME}"
+        command = (
+            "set -e; . ~/.nvm/nvm.sh; "
+            f"opencode db {shlex.quote(USAGE_SQL)} --format json "
+            f"> {shlex.quote(destination + '.tmp')}; "
+            f"mv {shlex.quote(destination + '.tmp')} {shlex.quote(destination)}"
+        )
+        try:
+            await asyncio.wait_for(
+                self.exec_as_agent(
+                    environment, command=command,
+                    timeout_sec=_USAGE_CAPTURE_TIMEOUT_SECONDS,
+                ),
+                timeout=_USAGE_CAPTURE_TIMEOUT_SECONDS,
             )
-            try:
-                await asyncio.wait_for(
-                    self.exec_as_agent(
-                        environment, command=command,
-                        timeout_sec=_USAGE_CAPTURE_TIMEOUT_SECONDS,
-                    ),
-                    timeout=_USAGE_CAPTURE_TIMEOUT_SECONDS,
-                )
-                # A timeout may leave OpenCode writing in the container; that
-                # snapshot is useful evidence but never a complete comparison.
-                self._usage_capture_complete = execution_complete
-            except Exception as exc:
-                # Preserve the original execution error, and fail closed in
-                # collection. Only the exception type enters the public report.
-                self._usage_capture_error = type(exc).__name__
-            finally:
-                self._usage_collection_wall_seconds = time.monotonic() - started
+            # Timed-out OpenCode may still be writing; retain but don't certify.
+            self._usage_capture_complete = execution_complete
+        except Exception as exc:
+            self._usage_capture_error = type(exc).__name__
+        finally:
+            self._usage_collection_wall_seconds = time.monotonic() - started
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
         super().populate_context_post_run(context)
         if not self._collect_session_usage:
+            if self._collect_session_trace:
+                self._write_trace_manifest()
             return
         events = self._parse_stdout()
         root_ids = {event.get("sessionID") for event in events if event.get("sessionID")}
@@ -129,7 +204,10 @@ class ResilientOpenCode(OpenCode):
             usage["errors"].append(
                 "snapshot_capture_failed:" + (self._usage_capture_error or snapshot_error)
             )
-        usage["collection_wall_seconds"] = self._usage_collection_wall_seconds
+        # Both exports run after the agent and must be removed from its time.
+        usage["collection_wall_seconds"] = (
+            self._usage_collection_wall_seconds + self._trace_collection_wall_seconds
+        )
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / "session-usage.json").write_text(
             json.dumps(usage, indent=2, sort_keys=True) + "\n"
@@ -140,6 +218,21 @@ class ResilientOpenCode(OpenCode):
         context.n_cache_tokens = total["cache_read_tokens"] + total["cache_write_tokens"]
         context.cost_usd = total["cost_usd"]
         context.metadata = {**(context.metadata or {}), "session_usage": usage}
+        if self._collect_session_trace:
+            self._write_trace_manifest(usage=usage)
+
+    def _write_trace_manifest(self, *, usage: dict | None = None) -> None:
+        directory = self.logs_dir / TRACE_DIRECTORY
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "instruction.txt").write_text(self._trace_instruction, encoding="utf-8")
+        manifest = validate_trace_directory(
+            directory, execution_complete=self._trace_execution_complete,
+            usage=usage, capture_error=self._trace_capture_error,
+        )
+        manifest["collection_wall_seconds"] = self._trace_collection_wall_seconds
+        (directory / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
@@ -148,6 +241,11 @@ class ResilientOpenCode(OpenCode):
             command="apt-get update && apt-get install -y curl",
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
+        rg_started = time.monotonic()
+        try:
+            await self.exec_as_root(environment, command=ripgrep_install_command())
+        finally:
+            self._ripgrep_install_wall_seconds = time.monotonic() - rg_started
 
         version_spec = f"@{self._version}" if self._version else "@latest"
         package_spec = shlex.quote(f"opencode-ai{version_spec}")

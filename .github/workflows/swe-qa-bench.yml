@@ -230,7 +230,7 @@ jobs:
           path: ${{ runner.temp }}/rust-package-cache/
           if-no-files-found: error
           overwrite: true
-          retention-days: 7
+          retention-days: 90
 
   run-pair:
     name: Pair + judge / ${{ matrix.task }}
@@ -320,6 +320,11 @@ jobs:
             --task "$TASK_NAME" \
             --expected-trials "$trials" \
             --output "$RUNNER_TEMP/pair-${TASK_NAME}.json"
+          uv run --project benchmarks/swe-qa-bench python -m zg_bench.reports.search_traces \
+            --runs-dir "$runs_dir" \
+            --output-dir "$runs_dir/search-traces" \
+            --expected-trials "$trials" \
+            --require-complete
       - name: Judge this pair and write its independent report
         env:
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
@@ -384,7 +389,7 @@ jobs:
             ${{ runner.temp }}/pair-${{ matrix.task }}.json
             ${{ runner.temp }}/swe-qa-runs/${{ matrix.task }}/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90
       - name: Upload independent task report
         if: always() && steps.authorize.outcome == 'success' && steps.secret-scan.outcome == 'success'
         uses: actions/upload-artifact@v7

@@ -23,6 +23,36 @@ Use your fork's Rust branch name or full commit SHA for `candidate_ref` when eva
 
 The versioned [`ci-config.json`](../ci-config.json) sets the trial count, failure retry limit, and model behind each embedding runtime. Change that file on the harness branch to change the fixed protocol; the workflow input selects one of those versioned runtimes, while environment variables carry endpoints and credentials.
 
-The run Summary shows the selected Rust commit and the aggregate of completed task reports. Download the `swe-qa-aggregate-report-*` artifact for `report.md`, `report.json`, and `candidate-manifest.json` (commit and tarball hash); individual task reports are retained for 90 days. Paired Harbor evidence, including failed attempts under `.retry-history/`, is retained for 30 days. If tasks fail, they are listed as missing and excluded from every Aggregate metric; the workflow still has a failed conclusion.
+The run Summary shows the selected Rust commit and the aggregate of completed task reports. Download the `swe-qa-aggregate-report-*` artifact for `report.md`, `report.json`, and `candidate-manifest.json` (commit and tarball hash). Candidate packages, reports and paired Harbor evidence, including failed attempts under `.retry-history/`, are retained for 90 days. If tasks fail, they are listed as missing and excluded from every Aggregate metric; the workflow still has a failed conclusion.
+
+Each OpenCode trial also records `agent/session-trace/`: the submitted instruction,
+the selected root session and all descendant session/message/part rows, referenced
+OpenCode overflow files, and a manifest with completeness checks and SHA256 hashes.
+The raw tool parts preserve input arguments and the output visible to the agent.
+This is separate from `session-usage.json`, which contains accounting rather than
+the full transcript. Failed attempts retain available partial evidence and cannot
+pass the complete-trace gate. Artifact publication still requires the secret scan.
+
+The paired artifact includes a `search-traces/` reading index and per-trial Markdown
+transcripts. It labels explicit shell `rg`, built-in `grep`, and zg MCP calls
+separately. Both profiles have pinned ripgrep available; the zvec-grep profile can
+still use standard tools. Compare complete paths for the same question rather than
+assuming that the profiles are rg-only and zg-only or that calls match one-to-one.
+
+Download every artifact into a new directory for the run:
+
+```sh
+gh run download RUN_ID --repo OWNER/zvec-grep --dir /absolute/path/to/evaluations/RUN_ID
+```
+
+Keep the original downloaded evidence alongside any derived reports. To regenerate
+the reading index for a task, point `--runs-dir` at its downloaded `swe-qa-runs/TASK`
+directory and use a separate output directory:
+
+```sh
+uv run --project benchmarks/swe-qa-bench python -m zg_bench.reports.search_traces \
+  --runs-dir /absolute/path/to/swe-qa-runs/TASK \
+  --output-dir /absolute/path/to/reading-index
+```
 
 References: [GitHub manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow), [Actions secrets](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets), [Bailian API keys](https://help.aliyun.com/zh/model-studio/get-api-key), [Bailian regions and endpoints](https://help.aliyun.com/zh/model-studio/regions/).
