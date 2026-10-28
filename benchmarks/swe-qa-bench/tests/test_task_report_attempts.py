@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from swe_qa_fixtures import (
     EXPECTED_TASK_IDS,
@@ -40,6 +42,9 @@ class TaskReportAttemptTests(unittest.TestCase):
             "BENCH_PROTOCOL_HASH": "c" * 64,
             "BENCH_SCOPE": "all-full",
             "SWE_QA_MODEL": "glm-5.2",
+            # The CLI must use the same endpoint identity as the stamped fixture,
+            # even when the outer workflow configures a real model endpoint.
+            "SWE_QA_MODEL_BASE_URL": "https://fixture.example/v1",
             "BENCH_EMBEDDING_RUNTIME": "local",
             "BENCH_EMBEDDING_MODEL": "local/potion-code-16m-v2",
         }
@@ -162,25 +167,24 @@ class TaskReportAttemptTests(unittest.TestCase):
     def test_single_artifact_flat_download_layout_and_cli(self):
         task = EXPECTED_TASK_IDS[0]
         directory = self.report(task, 2)
-        import os
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "zg_bench.ci.task_reports",
-                "select",
-                "--reports-root",
-                str(directory),
-                "--output-dir",
-                str(self.root / "selected"),
-                "--expected",
-                task,
-            ],
-            env={**os.environ, **self.env},
-            capture_output=True,
-            text=True,
-        )
+        with patch.dict(os.environ, {"SWE_QA_MODEL_BASE_URL": "https://ambient.example/v1"}):
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zg_bench.ci.task_reports",
+                    "select",
+                    "--reports-root",
+                    str(directory),
+                    "--output-dir",
+                    str(self.root / "selected"),
+                    "--expected",
+                    task,
+                ],
+                env={**os.environ, **self.env},
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["selected"][0]["attempt"], 2)
 
