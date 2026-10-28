@@ -58,6 +58,31 @@ def selected_fixture() -> dict:
     return trace
 
 
+def write_fixture_database(database: Path, trace: dict) -> None:
+    """Create the three queried tables in an isolated test database."""
+    with sqlite3.connect(database) as db:
+        db.executescript("""
+            DROP TABLE IF EXISTS part;
+            DROP TABLE IF EXISTS message;
+            DROP TABLE IF EXISTS session;
+            CREATE TABLE session(id TEXT, parent_id TEXT);
+            CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+            CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+        """)
+        for row in trace["sessions"]:
+            db.execute("INSERT INTO session VALUES (?,?)", (row["id"], row["parent_id"]))
+        for row in trace["messages"]:
+            db.execute("INSERT INTO message VALUES (?,?,?,?)", (row["id"], row["session_id"], row["time_created"], json.dumps(row["data"])))
+        for row in trace["parts"]:
+            db.execute("INSERT INTO part VALUES (?,?,?,?,?)", (row["id"], row["message_id"], row["session_id"], row["time_created"], json.dumps(row["data"])))
+
+
+def add_large_part(trace: dict) -> str:
+    body = "complete tool output 中文\n" * 100_000 + "END_OF_LARGE_PART"
+    next(p for p in trace["parts"] if p["id"] == "grandchild-search")["data"]["state"]["output"] = body
+    return body
+
+
 class TraceValidationTests(unittest.TestCase):
     def validate(self, value: dict, *, execution_complete=True, usage=None) -> dict:
         with tempfile.TemporaryDirectory() as temp:
@@ -127,12 +152,15 @@ class TraceCaptureTests(unittest.TestCase):
         (self.directory / "instruction.txt").write_text("Original question")
         (self.logs / "opencode.txt").write_text('diagnostic text\n{"sessionID":"root","type":"text"}\n')
         self.db = self.root / "fixture.sqlite"
+        self.capture_tmp = self.root / "capture-tmp"
+        self.capture_tmp.mkdir()
         self.binary = self.root / "opencode"
         self.binary.write_text(f"#!{sys.executable}\n" + """
 import json, os, sqlite3, sys
 query = sys.argv[2]
 if os.environ.get('TRACE_TEST_FAIL_TABLE') and ('SELECT * FROM ' + os.environ['TRACE_TEST_FAIL_TABLE']) in query:
-    sys.exit(1)
+    sys.stderr.write('PRIVATE_PROVIDER_DIAGNOSTIC_DO_NOT_PUBLISH')
+    sys.exit(7)
 db = sqlite3.connect(os.environ['TRACE_TEST_DATABASE'])
 db.row_factory = sqlite3.Row
 print(json.dumps([dict(row) for row in db.execute(query)]))
@@ -141,22 +169,10 @@ print(json.dumps([dict(row) for row in db.execute(query)]))
 
     def capture(self, trace=None, *, fail_table=""):
         trace = trace or trace_fixture()
-        db = sqlite3.connect(self.db)
-        db.executescript("""
-            CREATE TABLE session(id TEXT, parent_id TEXT);
-            CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
-            CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
-        """)
-        for row in trace["sessions"]:
-            db.execute("INSERT INTO session VALUES (?,?)", (row["id"], row["parent_id"]))
-        for row in trace["messages"]:
-            db.execute("INSERT INTO message VALUES (?,?,?,?)", (row["id"], row["session_id"], row["time_created"], json.dumps(row["data"])))
-        for row in trace["parts"]:
-            db.execute("INSERT INTO part VALUES (?,?,?,?,?)", (row["id"], row["message_id"], row["session_id"], row["time_created"], json.dumps(row["data"])))
-        db.commit()
-        db.close()
+        write_fixture_database(self.db, trace)
         env = {**os.environ, "HOME": str(self.root), "XDG_DATA_HOME": str(self.root / "data"),
-            "TRACE_TEST_DATABASE": str(self.db), "TRACE_TEST_FAIL_TABLE": fail_table}
+            "TRACE_TEST_DATABASE": str(self.db), "TRACE_TEST_FAIL_TABLE": fail_table,
+            "TMPDIR": str(self.capture_tmp)}
         subprocess.run(["node", "-e", trace_capture_script(str(self.logs), opencode=str(self.binary))],
             env=env, check=True, capture_output=True, text=True, timeout=20)
         return json.loads((self.directory / "trace.json").read_text())
@@ -181,6 +197,41 @@ print(json.dumps([dict(row) for row in db.execute(query)]))
         manifest = validate_trace_directory(self.directory, execution_complete=True)
         self.assertFalse(manifest["complete"])
         self.assertIn("db_export_failed:part", manifest["errors"])
+        diagnostic = next(item for item in trace["export_diagnostics"] if item["table"] == "part")
+        self.assertEqual(diagnostic["exit_code"], 7)
+        self.assertEqual(diagnostic["stdout_bytes"], 0)
+        self.assertGreater(diagnostic["stderr_bytes"], 0)
+        self.assertEqual(diagnostic["stage"], "process")
+        self.assertNotIn("PRIVATE_PROVIDER_DIAGNOSTIC", json.dumps(trace))
+        self.assertEqual(list(self.capture_tmp.iterdir()), [])
+
+    def test_abrupt_cli_exit_cannot_truncate_large_export(self):
+        trace = selected_fixture()
+        expected = add_large_part(trace)
+        (self.root / "fixture.sqlite.rows.json").write_text(json.dumps(trace))
+        # Reproduce console.log/process.exit's unflushed pipe failure without
+        # requiring the real binary in the ordinary offline regression suite.
+        self.binary.write_text(f"#!{shutil.which('node')}\n" + r"""
+const fs = require('fs');
+const trace = JSON.parse(fs.readFileSync(process.env.TRACE_TEST_DATABASE + '.rows.json', 'utf8'));
+const query = process.argv[3];
+const table = query.includes('SELECT * FROM session') ? 'sessions'
+  : query.includes('SELECT * FROM message') ? 'messages' : 'parts';
+const rows = trace[table].map(row => row.data ? {...row, data: JSON.stringify(row.data)} : row);
+process.stdout.write(JSON.stringify(rows));
+process.exit(0);
+""")
+        result = self.capture(trace)
+        actual = next(p for p in result["parts"] if p["id"] == "grandchild-search")["data"]["state"]["output"]
+        self.assertEqual(actual, expected)
+        diagnostic = next(item for item in result["export_diagnostics"] if item["table"] == "part")
+        self.assertEqual(diagnostic["stage"], "complete")
+        self.assertGreater(diagnostic["stdout_bytes"], 2 * 1024 * 1024)
+        self.assertEqual(diagnostic["exit_code"], 0)
+        self.assertIsNone(diagnostic["error_code"])
+        self.assertEqual(diagnostic["stderr_bytes"], 0)
+        self.assertEqual(list(self.capture_tmp.iterdir()), [])
+        self.assertTrue(validate_trace_directory(self.directory, execution_complete=True)["complete"])
 
     def test_ambiguous_root_never_exports_any_sessions(self):
         (self.logs / "opencode.txt").write_text('{"sessionID":"root"}\n{"sessionID":"unrelated"}\n')
@@ -213,6 +264,45 @@ print(json.dumps([dict(row) for row in db.execute(query)]))
         manifest = validate_trace_directory(self.directory, execution_complete=True)
         self.assertFalse(manifest["complete"])
         self.assertTrue(any(error.startswith("overflow_not_saved") for error in manifest["errors"]))
+
+
+@unittest.skipUnless(
+    os.environ.get("OPENCODE_BENCHMARK_TEST_BINARY") and shutil.which("node"),
+    "requires pinned OpenCode; queries only a temporary SQLite fixture, no model",
+)
+class RealOpenCodeLargeExportTests(unittest.TestCase):
+    def test_real_pinned_cli_preserves_large_selected_part_table(self):
+        requested = os.environ["OPENCODE_BENCHMARK_TEST_BINARY"]
+        binary = shutil.which(requested) or str(Path(requested).resolve())
+        with tempfile.TemporaryDirectory(prefix="opencode-large-export-") as temp:
+            root = Path(temp).resolve()
+            env = {**os.environ, "HOME": str(root), "OPENCODE_DISABLE_MODELS_FETCH": "true",
+                **{f"XDG_{name.upper()}_HOME": str(root / name) for name in ("data", "config", "cache", "state")}}
+            self.assertEqual(subprocess.check_output([binary, "--version"], env=env, text=True, timeout=15).strip(), "1.18.4")
+            subprocess.run([binary, "db", "SELECT 1", "--format", "json"], env=env,
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
+            database = Path(subprocess.check_output([binary, "db", "path"], env=env, text=True, timeout=20).strip()).resolve()
+            self.assertTrue(database.is_relative_to(root), "never modify a non-fixture OpenCode database")
+            trace = trace_fixture()
+            expected = add_large_part(trace)
+            write_fixture_database(database, trace)
+            logs = root / "logs"
+            directory = logs / "session-trace"
+            directory.mkdir(parents=True)
+            (directory / "instruction.txt").write_text("Original question")
+            (logs / "opencode.txt").write_text('{"sessionID":"root"}\n')
+            subprocess.run(["node", "-e", trace_capture_script(str(logs), opencode=binary)],
+                env=env, check=True, capture_output=True, text=True, timeout=90)
+            captured = json.loads((directory / "trace.json").read_text())
+            self.assertEqual({row["id"] for row in captured["sessions"]}, {"root", "child", "grandchild"})
+            actual = next(p for p in captured["parts"] if p["id"] == "grandchild-search")["data"]["state"]["output"]
+            self.assertEqual(actual, expected)
+            self.assertNotIn("UNRELATED_PRIVATE_CONTENT", json.dumps(captured))
+            manifest = validate_trace_directory(directory, execution_complete=True)
+            self.assertTrue(manifest["complete"], manifest["errors"])
+            diagnostic = next(item for item in captured["export_diagnostics"] if item["table"] == "part")
+            self.assertEqual(diagnostic["stage"], "complete")
+            self.assertGreater(diagnostic["stdout_bytes"], 2 * 1024 * 1024)
 
 
 if __name__ == "__main__":

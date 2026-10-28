@@ -21,6 +21,15 @@ gh workflow run swe-qa-bench.yml --repo OWNER/zvec-grep \
 
 Use your fork's Rust branch name or full commit SHA for `candidate_ref` when evaluating a change. `--ref` selects the **benchmark harness**; `candidate_ref` selects the **Rust package**. The workflow does not run from a pull request or push, and it does not use upstream CI resources. A GitHub user with only `write` access may see the dispatch button, but the workflow rejects the run before checkout or model-secret use.
 
+For recovery after a harness fix, `task_slugs` can select a comma-separated subset
+of the locked scope, such as `-f scope=all-full -f task_slugs=sqlfluff-2,sympy-38`.
+Each selected task still runs all five trials in both profiles. This creates a new
+run with its own candidate/harness identity and a report for only those tasks.
+Keep the original run's artifacts and provenance; do not relabel them as results
+from the new harness or present the subset report as a complete 20-task evaluation.
+Rerunning failed jobs on the original run uses its original commit and cannot pick
+up a collector fix committed later.
+
 The versioned [`ci-config.json`](../ci-config.json) sets the trial count, failure retry limit, and model behind each embedding runtime. Change that file on the harness branch to change the fixed protocol; the workflow input selects one of those versioned runtimes, while environment variables carry endpoints and credentials.
 
 The run Summary shows the selected Rust commit and the aggregate of completed task reports. Download the `swe-qa-aggregate-report-*` artifact for `report.md`, `report.json`, and `candidate-manifest.json` (commit and tarball hash). Candidate packages, reports and paired Harbor evidence, including failed attempts under `.retry-history/`, are retained for 90 days. If tasks fail, they are listed as missing and excluded from every Aggregate metric; the workflow still has a failed conclusion.

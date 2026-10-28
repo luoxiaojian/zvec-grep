@@ -38,10 +38,23 @@ def select_ci_tasks(
     return task_ids, [tasks_by_id[task_id]["task_slug"] for task_id in task_ids]
 
 
-def matrix_outputs(selection_path: Path, scope: str) -> str:
+def matrix_outputs(selection_path: Path, scope: str, task_slugs: str = "") -> str:
     task_ids, slugs = select_ci_tasks(
         load_object(selection_path, label="selection"), scope
     )
+    if task_slugs:
+        requested = [slug.strip() for slug in task_slugs.split(",")]
+        if any(not slug for slug in requested) or len(set(requested)) != len(requested):
+            raise SweQaError("task filter must contain non-empty, unique task slugs")
+        unknown = sorted(set(requested) - set(slugs))
+        if unknown:
+            raise SweQaError(f"task filter is outside SWE-QA scope {scope}: {unknown}")
+        selected = [
+            (task_id, slug)
+            for task_id, slug in zip(task_ids, slugs)
+            if slug in requested
+        ]
+        task_ids, slugs = map(list, zip(*selected))
     return (
         "\n".join(
             (

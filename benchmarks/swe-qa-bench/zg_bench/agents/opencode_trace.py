@@ -19,12 +19,13 @@ TRACE_SCOPE = "opencode-session-tree-trace-v1"
 # supported database CLI instead of adding a sqlite executable or Python module
 # to each task container. Each query is restricted to the stdout root's tree.
 _CAPTURE_SCRIPT = r"""
-const fs = require('fs'), path = require('path'), cp = require('child_process');
+const fs = require('fs'), path = require('path'), cp = require('child_process'), os = require('os');
 const crypto = require('crypto');
 const directory = path.join(config.logsDir, 'session-trace');
 fs.mkdirSync(directory, {recursive: true});
 const trace = {schema_version: 1, scope: 'opencode-session-tree-trace-v1',
-  root_session_id: null, sessions: [], messages: [], parts: [], overflow: [], errors: []};
+  root_session_id: null, sessions: [], messages: [], parts: [], overflow: [], errors: [],
+  export_diagnostics: []};
 function save() {
   const target = path.join(directory, 'trace.json');
   fs.writeFileSync(target + '.tmp', JSON.stringify(trace, null, 2) + '\n');
@@ -41,12 +42,47 @@ function query(table) {
     SELECT id FROM session WHERE id = '${root}'
     UNION SELECT s.id FROM session s JOIN selected p ON s.parent_id = p.id
   ) SELECT * FROM ${table} WHERE ${column} IN (SELECT id FROM selected) ORDER BY id`;
-  const result = cp.spawnSync(config.opencode, ['db', sql, '--format', 'json'],
-    {encoding: 'utf8', timeout: 20000, maxBuffer: 128 * 1024 * 1024});
-  if (result.error || result.status !== 0) throw new Error('db_export_failed:' + table);
-  const rows = JSON.parse(result.stdout);
-  if (!Array.isArray(rows)) throw new Error('invalid_db_rows:' + table);
-  return rows.map(decode);
+  const diagnostic = {table, exit_code: null, error_code: null, signal: null,
+    stdout_bytes: 0, stderr_bytes: 0, duration_ms: 0, stage: 'create_files'};
+  trace.export_diagnostics.push(diagnostic);
+  const started = Date.now();
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'zg-opencode-db-export-'));
+  const stdoutPath = path.join(temporary, 'stdout.json'), stderrPath = path.join(temporary, 'stderr');
+  let stdoutFd, stderrFd;
+  try {
+    stdoutFd = fs.openSync(stdoutPath, 'wx', 0o600);
+    stderrFd = fs.openSync(stderrPath, 'wx', 0o600);
+    diagnostic.stage = 'process';
+    // OpenCode 1.18.4 may exit before a large piped console.log is flushed,
+    // returning status 0 with truncated JSON. A regular-file stdout is written
+    // synchronously by the CLI and also avoids spawnSync's maxBuffer limit.
+    // Do not publish stderr: it can contain arbitrary provider/config details.
+    const result = cp.spawnSync(config.opencode, ['db', sql, '--format', 'json'],
+      {stdio: ['ignore', stdoutFd, stderrFd], timeout: 20000});
+    diagnostic.exit_code = result.status;
+    diagnostic.error_code = /^[A-Z0-9_]+$/.test(result.error?.code || '') ? result.error.code : null;
+    diagnostic.signal = /^SIG[A-Z0-9]+$/.test(result.signal || '') ? result.signal : null;
+    fs.closeSync(stdoutFd); stdoutFd = undefined;
+    fs.closeSync(stderrFd); stderrFd = undefined;
+    diagnostic.stdout_bytes = fs.statSync(stdoutPath).size;
+    diagnostic.stderr_bytes = fs.statSync(stderrPath).size;
+    if (result.error || result.status !== 0) throw new Error('db_export_failed:' + table);
+    diagnostic.stage = 'parse_json';
+    const rows = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
+    diagnostic.stage = 'validate_rows';
+    if (!Array.isArray(rows)) throw new Error('invalid_db_rows:' + table);
+    diagnostic.stage = 'decode_rows';
+    const decoded = rows.map(decode);
+    diagnostic.stage = 'complete';
+    diagnostic.row_count = decoded.length;
+    return decoded;
+  } finally {
+    diagnostic.duration_ms = Date.now() - started;
+    if (stdoutFd !== undefined) fs.closeSync(stdoutFd);
+    if (stderrFd !== undefined) fs.closeSync(stderrFd);
+    // Unparsed provider stderr and temporary exports never enter artifacts.
+    fs.rmSync(temporary, {recursive: true, force: true});
+  }
 }
 function overflowPaths() {
   const found = new Set();

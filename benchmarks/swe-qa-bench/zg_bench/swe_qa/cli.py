@@ -35,6 +35,10 @@ def _parser() -> argparse.ArgumentParser:
     matrix = commands.add_parser("matrix", help="select the locked CI task scope")
     matrix.add_argument("--selection", type=Path, required=True)
     matrix.add_argument("--scope", choices=CI_SCOPES, required=True)
+    matrix.add_argument(
+        "--task-slugs", default="",
+        help="optional comma-separated subset of the selected scope",
+    )
 
     collect = commands.add_parser("collect", help="collect one Harbor profile pair")
     collect.add_argument("--runs-dir", type=Path, required=True)
@@ -75,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(result, ensure_ascii=False))
         elif args.command == "matrix":
-            print(matrix_outputs(args.selection, args.scope), end="")
+            print(matrix_outputs(args.selection, args.scope, args.task_slugs), end="")
         elif args.command == "collect":
             pair = collect_pair(
                 runs_dir=args.runs_dir,

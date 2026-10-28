@@ -11,6 +11,9 @@ from pathlib import Path
 
 import yaml
 
+from zg_bench.core.errors import SweQaError
+from zg_bench.swe_qa.selection import matrix_outputs
+
 ROOT = Path(__file__).resolve().parents[3]
 BENCHMARK = ROOT / "benchmarks/swe-qa-bench"
 WORKFLOW = ROOT / ".github/workflows/swe-qa-bench.yml"
@@ -133,6 +136,32 @@ class BenchmarkWorkflowTests(unittest.TestCase):
                 item for item in aggregate["steps"] if item.get("name") == step_name
             )
             self.assertNotIn("if", step)
+
+    def test_recovery_filter_preserves_locked_order_and_trial_count(self) -> None:
+        selection = BENCHMARK / "zg_bench/swe_qa/data/selection.json"
+        outputs = dict(
+            line.split("=", 1)
+            for line in matrix_outputs(
+                selection, "all-full", "sympy-38, sqlfluff-2"
+            ).splitlines()
+        )
+        self.assertEqual(json.loads(outputs["tasks"]), ["sqlfluff-2", "sympy-38"])
+        self.assertEqual(json.loads(outputs["task_ids_json"]), ["sqlfluff:2", "sympy:38"])
+        self.assertEqual(outputs["count"], "2")
+        for scope, invalid in (
+            ("all-full", "sqlfluff-2,sqlfluff-2"),
+            ("all-full", "sqlfluff-2,"),
+            ("all-full", "unknown-1"),
+            ("repro-3", "sqlfluff-2"),
+        ):
+            with self.subTest(scope=scope, invalid=invalid), self.assertRaises(SweQaError):
+                matrix_outputs(selection, scope, invalid)
+        matrix = next(
+            step for step in self.workflow["jobs"]["validate"]["steps"]
+            if step.get("id") == "task-matrix"
+        )
+        self.assertEqual(matrix["env"]["TASK_SLUGS"], "${{ inputs.task_slugs }}")
+        self.assertIn('--task-slugs "$TASK_SLUGS"', matrix["run"])
 
     def test_workflow_calls_testable_retry_and_secret_scan_modules(self) -> None:
         workflow_text = WORKFLOW.read_text()

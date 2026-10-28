@@ -1,5 +1,5 @@
 name: SWE-QA Bench
-run-name: SWE-QA Bench / Rust ${{ inputs.candidate_ref || 'main' }} / ${{ inputs.model || 'glm-5.2' }} / ${{ inputs.embedding || 'local' }} embedding / ${{ inputs.scope || 'repro-3' }}
+run-name: SWE-QA Bench / Rust ${{ inputs.candidate_ref || 'main' }} / ${{ inputs.model || 'glm-5.2' }} / ${{ inputs.embedding || 'local' }} embedding / ${{ inputs.scope || 'repro-3' }}${{ inputs.task_slugs && ' (selected tasks)' || '' }}
 
 on:
   workflow_call:
@@ -12,6 +12,9 @@ on:
         type: string
       scope:
         default: all-full
+        type: string
+      task_slugs:
+        default: ''
         type: string
       model:
         default: glm-5.2
@@ -40,6 +43,11 @@ on:
           - repro-3
           - all-full
           - smoke
+      task_slugs:
+        description: Optional comma-separated task slugs within scope, for targeted recovery
+        required: false
+        default: ''
+        type: string
       model:
         description: Use this model for both execution and self-judging
         required: true
@@ -139,10 +147,11 @@ jobs:
         id: task-matrix
         env:
           SCOPE: ${{ inputs.scope }}
+          TASK_SLUGS: ${{ inputs.task_slugs }}
         run: |
           uv run --project benchmarks/swe-qa-bench python -m zg_bench.swe_qa matrix \
             --selection benchmarks/swe-qa-bench/zg_bench/swe_qa/data/selection.json \
-            --scope "$SCOPE" >> "$GITHUB_OUTPUT"
+            --scope "$SCOPE" --task-slugs "$TASK_SLUGS" >> "$GITHUB_OUTPUT"
       - name: Resolve and validate the embedding runtime
         id: embedding
         env:
